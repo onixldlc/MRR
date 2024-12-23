@@ -6,6 +6,7 @@ import (
     "encoding/json"
     "fmt"
     "io/ioutil"
+    "os"
     "sync"
     "syscall"
     "time"
@@ -28,11 +29,11 @@ const (
 )
 
 type MOUSEINPUT struct {
-    Dx         int32
-    Dy         int32
-    MouseData  uint32
-    DwFlags    uint32
-    Time       uint32
+    Dx          int32
+    Dy          int32
+    MouseData   uint32
+    DwFlags     uint32
+    Time        uint32
     DwExtraInfo uintptr
 }
 
@@ -42,16 +43,16 @@ type INPUT struct {
 }
 
 var (
-    user32          = syscall.MustLoadDLL("user32.dll")
-    kernel32        = syscall.MustLoadDLL("kernel32.dll")
+    user32   = syscall.MustLoadDLL("user32.dll")
+    kernel32 = syscall.MustLoadDLL("kernel32.dll")
 
     // Hooks
-    procSetWindowsHookExW    = user32.MustFindProc("SetWindowsHookExW")
-    procCallNextHookEx       = user32.MustFindProc("CallNextHookEx")
-    procGetMessageW          = user32.MustFindProc("GetMessageW")
-    procUnhookWindowsHookEx  = user32.MustFindProc("UnhookWindowsHookEx")
-    procSetCursorPos         = user32.MustFindProc("SetCursorPos")
-    procMouseEvent           = user32.MustFindProc("mouse_event")
+    procSetWindowsHookExW   = user32.MustFindProc("SetWindowsHookExW")
+    procCallNextHookEx      = user32.MustFindProc("CallNextHookEx")
+    procGetMessageW         = user32.MustFindProc("GetMessageW")
+    procUnhookWindowsHookEx = user32.MustFindProc("UnhookWindowsHookEx")
+    procSetCursorPos        = user32.MustFindProc("SetCursorPos")
+    procMouseEvent          = user32.MustFindProc("mouse_event")
 
     // NEW: We import SendInput
     procSendInput = user32.MustFindProc("SendInput")
@@ -123,6 +124,9 @@ var (
     recordingStarted = false
 )
 
+// NEW: We'll add a global debugMode
+var debugMode bool
+
 type MouseRecord struct {
     DeltaMS int64  `json:"DeltaMS"`
     X       int32  `json:"X"`
@@ -151,6 +155,21 @@ func sendXButtonInput(flags, xbutton uint32) {
         uintptr(unsafe.Pointer(&inp)),
         uintptr(unsafe.Sizeof(inp)),
     )
+}
+
+// ------------------------------------------------------------------
+//     HELPER DEBUG PRINT FUNCTIONS
+// ------------------------------------------------------------------
+func debugPrintln(a ...interface{}) {
+    if debugMode {
+        fmt.Println(a...)
+    }
+}
+
+func debugPrintf(format string, a ...interface{}) {
+    if debugMode {
+        fmt.Printf(format, a...)
+    }
 }
 
 // ------------------------------------------
@@ -240,7 +259,8 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
         event = "MouseMove"
     }
 
-    fmt.Printf("Detected event: %s, X: %d, Y: %d, Data: %d\n", event, x, y, mouseData)
+    // Print debug only if --debug
+    debugPrintf("Detected event: %s, X: %d, Y: %d, Data: %d\n", event, x, y, mouseData)
 
     if rec {
         now := time.Now()
@@ -263,6 +283,14 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 }
 
 func main() {
+    // Check for --debug in args
+    for _, arg := range os.Args[1:] {
+        if arg == "--debug" {
+            debugMode = true
+            break
+        }
+    }
+
     err := installHooks()
     if err != nil {
         fmt.Println("[ERROR] Could not install hooks:", err)
@@ -270,6 +298,7 @@ func main() {
     }
     defer unInstallHooks()
 
+    // Always show instructions to user
     fmt.Println("=======================================================")
     fmt.Println(" Mouse Recorder & Replayer (Modified)")
     fmt.Println("=======================================================")
@@ -277,6 +306,7 @@ func main() {
     fmt.Println(" Press END to replay recorded movements.")
     fmt.Println(" Close this console or press Ctrl+C to exit.")
     fmt.Println()
+    fmt.Println(" Run with --debug to see verbose logs.")
 
     runMessageLoop()
 }
