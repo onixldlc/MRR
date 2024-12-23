@@ -12,16 +12,9 @@ import (
 	"unsafe"
 )
 
-// The name of the file where mouse recording is saved.
 const (
 	recordFileName = "recorded-mice.cfg"
-)
 
-// -----------------------------------------------------------------------------
-// Win32 API constants & structures
-// -----------------------------------------------------------------------------
-
-const (
 	WH_KEYBOARD_LL = 13
 	WH_MOUSE_LL    = 14
 
@@ -31,11 +24,15 @@ const (
 	VK_INSERT = 0x2D
 	VK_END    = 0x23
 
-	// For the message loop
 	WM_QUIT = 0x0012
+
+	WM_LBUTTONDOWN = 0x0201
+	WM_LBUTTONUP   = 0x0202
+	WM_RBUTTONDOWN = 0x0204
+	WM_RBUTTONUP   = 0x0205
+	WM_MOUSEWHEEL  = 0x020A
 )
 
-// KBDLLHOOKSTRUCT as defined in WinUser.h (low-level keyboard hook).
 type KBDLLHOOKSTRUCT struct {
 	VKCode      uint32
 	ScanCode    uint32
@@ -44,7 +41,6 @@ type KBDLLHOOKSTRUCT struct {
 	ExtraInfo   uintptr
 }
 
-// MSLLHOOKSTRUCT as defined in WinUser.h (low-level mouse hook).
 type MSLLHOOKSTRUCT struct {
 	Point     POINT
 	MouseData uint32
@@ -53,13 +49,11 @@ type MSLLHOOKSTRUCT struct {
 	ExtraInfo uintptr
 }
 
-// POINT structure for mouse coordinate.
 type POINT struct {
 	X int32
 	Y int32
 }
 
-// MSG structure for the message loop.
 type MSG struct {
 	HWND    uintptr
 	Message uint32
@@ -69,10 +63,6 @@ type MSG struct {
 	Pt      POINT
 }
 
-// -----------------------------------------------------------------------------
-// Global variables
-// -----------------------------------------------------------------------------
-
 var (
 	user32              = syscall.MustLoadDLL("user32.dll")
 	kernel32            = syscall.MustLoadDLL("kernel32.dll")
@@ -81,75 +71,61 @@ var (
 	procCallNextHookEx    = user32.MustFindProc("CallNextHookEx")
 	procGetMessageW       = user32.MustFindProc("GetMessageW")
 	procSetCursorPos      = user32.MustFindProc("SetCursorPos")
-	procGetCursorPos      = user32.MustFindProc("GetCursorPos")
+	procMouseEvent        = user32.MustFindProc("mouse_event")
 	procUnhookWindowsHookEx = user32.MustFindProc("UnhookWindowsHookEx")
 
-	// Hooks
 	hKeyboardHook syscall.Handle
 	hMouseHook    syscall.Handle
 
-	// Synchronization
 	mtx          sync.Mutex
 	isRecording  bool
 	recordedData []MouseRecord
-
-	// For timing the recordings
 	lastEventTime time.Time
 )
 
-// MouseRecord is the structure we will save for each event.
 type MouseRecord struct {
-	// DeltaMS is how many milliseconds have passed since the previous event.
-	DeltaMS int64 `json:"DeltaMS"`
-	// X, Y store the absolute coordinates of the mouse.
-	X       int32 `json:"X"`
-	Y       int32 `json:"Y"`
+	DeltaMS int64  `json:"DeltaMS"`
+	X       int32  `json:"X"`
+	Y       int32  `json:"Y"`
+	Event   string `json:"Event"`
+	Data    int32  `json:"Data"`
 }
 
-// -----------------------------------------------------------------------------
-// Hook procedures (exported via cgo syntax for callback from Windows)
-// -----------------------------------------------------------------------------
+var (
+	recordingStarted = false
+)
 
-//export keyboardHookProc
 func keyboardHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
-	// If code < 0, skip
 	if code < 0 {
 		ret, _, _ := procCallNextHookEx.Call(0, uintptr(code), wparam, lparam)
 		return ret
 	}
 
-	// We only care about WM_KEYDOWN or WM_SYSKEYDOWN
 	if wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN {
 		kbStruct := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lparam))
 		switch kbStruct.VKCode {
 		case VK_INSERT:
-			// Start recording
 			mtx.Lock()
-			isRecording = true
-			recordedData = make([]MouseRecord, 0)
-			lastEventTime = time.Now()
+			if recordingStarted {
+				isRecording = false
+				recordingStarted = false
+				fmt.Println("[INFO] Insert key pressed -> Stop recording")
+				dumpToFile(recordFileName, recordedData)
+			} else {
+				isRecording = true
+				recordingStarted = true
+				recordedData = make([]MouseRecord, 0)
+				lastEventTime = time.Now()
+				fmt.Println("[INFO] Insert key pressed -> Start recording")
+			}
 			mtx.Unlock()
-
-			fmt.Println("[INFO] Insert key pressed -> Start recording")
 
 		case VK_END:
-			// Stop recording, dump data, replay
-			mtx.Lock()
-			isRecording = false
-			err := dumpToFile(recordFileName, recordedData)
-			mtx.Unlock()
-
-			if err != nil {
-				fmt.Println("[ERROR] Could not write to file:", err)
+			fmt.Println("[INFO] End key pressed -> Replaying recorded movements")
+			if err := replayFromFile(recordFileName); err != nil {
+				fmt.Println("[ERROR] Replay failed:", err)
 			} else {
-				fmt.Println("[INFO] Recording saved to", recordFileName)
-				fmt.Println("[INFO] Now replaying the recorded movements...")
-				err = replayFromFile(recordFileName)
-				if err != nil {
-					fmt.Println("[ERROR] Replay failed:", err)
-				} else {
-					fmt.Println("[INFO] Replay completed.")
-				}
+				fmt.Println("[INFO] Replay completed.")
 			}
 		}
 	}
@@ -158,31 +134,38 @@ func keyboardHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 	return ret
 }
 
-//export mouseHookProc
 func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 	if code < 0 {
 		ret, _, _ := procCallNextHookEx.Call(0, uintptr(code), wparam, lparam)
 		return ret
 	}
 
-	// Record only if we are in isRecording mode
 	mtx.Lock()
 	rec := isRecording
 	mtx.Unlock()
 
 	if rec {
-		// Low-level mouse hook data
 		msStruct := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lparam))
-
-		// We only handle mouse move messages. Windows doesn't directly send
-		// "mouse move" codes in wparam for WH_MOUSE_LL, but we can track
-		// all mouse events or check if the position changed from last time.
-		// To be safe and extremely accurate, let's store an event on *every*
-		// hook callback. You could filter further if desired.
 		x := msStruct.Point.X
 		y := msStruct.Point.Y
+		mouseData := int32(msStruct.MouseData) >> 16 // Extract signed scroll data
+		event := ""
 
-		// Compute delta time
+		switch wparam {
+		case WM_LBUTTONDOWN:
+			event = "LeftButtonDown"
+		case WM_LBUTTONUP:
+			event = "LeftButtonUp"
+		case WM_RBUTTONDOWN:
+			event = "RightButtonDown"
+		case WM_RBUTTONUP:
+			event = "RightButtonUp"
+		case WM_MOUSEWHEEL:
+			event = "MouseWheel"
+		default:
+			event = "MouseMove"
+		}
+
 		now := time.Now()
 
 		mtx.Lock()
@@ -193,6 +176,8 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 			DeltaMS: delta.Milliseconds(),
 			X:       x,
 			Y:       y,
+			Event:   event,
+			Data:    mouseData,
 		})
 		mtx.Unlock()
 	}
@@ -201,12 +186,7 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 	return ret
 }
 
-// -----------------------------------------------------------------------------
-// Main
-// -----------------------------------------------------------------------------
-
 func main() {
-	// Install hooks
 	err := installHooks()
 	if err != nil {
 		fmt.Println("[ERROR] Could not install hooks:", err)
@@ -215,23 +195,17 @@ func main() {
 	defer unInstallHooks()
 
 	fmt.Println("=======================================================")
-	fmt.Println(" Mouse Recorder & Replayer (Go + WinAPI, no extra deps)")
+	fmt.Println(" Mouse Recorder & Replayer (Modified)")
 	fmt.Println("=======================================================")
-	fmt.Println(" Press INSERT to start recording mouse movements.")
-	fmt.Println(" Press END to stop recording, save to file, and replay.")
+	fmt.Println(" Press INSERT to toggle recording.")
+	fmt.Println(" Press END to replay recorded movements.")
 	fmt.Println(" Close this console or press Ctrl+C to exit.")
 	fmt.Println()
 
-	// Message loop so hooks actually function
 	runMessageLoop()
 }
 
-// -----------------------------------------------------------------------------
-// Helper Functions
-// -----------------------------------------------------------------------------
-
 func installHooks() error {
-	// Keyboard hook
 	hk, _, err := procSetWindowsHookExW.Call(
 		uintptr(WH_KEYBOARD_LL),
 		syscall.NewCallback(keyboardHookProc),
@@ -243,7 +217,6 @@ func installHooks() error {
 	}
 	hKeyboardHook = syscall.Handle(hk)
 
-	// Mouse hook
 	hm, _, err := procSetWindowsHookExW.Call(
 		uintptr(WH_MOUSE_LL),
 		syscall.NewCallback(mouseHookProc),
@@ -279,16 +252,12 @@ func runMessageLoop() {
 			0,
 		)
 
-		// If r == 0, WM_QUIT received -> exit
 		if r == 0 {
 			break
 		}
-		// Otherwise, do default message translation & dispatch
-		// In a typical Win32 program you'd call TranslateMessage, DispatchMessage, etc.
 	}
 }
 
-// dumpToFile writes recorded mouse events to the given filename in JSON format.
 func dumpToFile(filename string, data []MouseRecord) error {
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -297,7 +266,6 @@ func dumpToFile(filename string, data []MouseRecord) error {
 	return ioutil.WriteFile(filename, b, 0644)
 }
 
-// replayFromFile reads the mouse events from filename, then replays them.
 func replayFromFile(filename string) error {
 	b, err := ioutil.ReadFile(filename)
 	if err != nil {
@@ -310,24 +278,32 @@ func replayFromFile(filename string) error {
 		return err
 	}
 
-	// Now replay
-	// We assume each record has DeltaMS and X, Y
 	for i, rec := range records {
-		if i == 0 {
-			// First event, no need to sleep
-		} else {
-			// Sleep the delta from the previous event
+		if i != 0 {
 			time.Sleep(time.Duration(rec.DeltaMS) * time.Millisecond)
 		}
-
-		// Move mouse
 		setCursorPos(int(rec.X), int(rec.Y))
+		sendMouseEvent(rec.Event, rec.Data)
 	}
 
 	return nil
 }
 
-// setCursorPos calls the Windows API SetCursorPos(x, y).
 func setCursorPos(x, y int) {
 	procSetCursorPos.Call(uintptr(x), uintptr(y))
+}
+
+func sendMouseEvent(event string, data int32) {
+	switch event {
+	case "LeftButtonDown":
+		procMouseEvent.Call(0x02, 0, 0, 0, 0)
+	case "LeftButtonUp":
+		procMouseEvent.Call(0x04, 0, 0, 0, 0)
+	case "RightButtonDown":
+		procMouseEvent.Call(0x08, 0, 0, 0, 0)
+	case "RightButtonUp":
+		procMouseEvent.Call(0x10, 0, 0, 0, 0)
+	case "MouseWheel":
+		procMouseEvent.Call(0x0800, 0, 0, uintptr(data), 0)
+	}
 }
